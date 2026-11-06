@@ -19,8 +19,9 @@ import {FixedPoint96} from "@uniswap/v4-core/src/libraries/FixedPoint96.sol";
 
 /// @title ReopenAuctionHook
 /// @notice Sells the first swap after a market reopen to the highest bidder and pays the bid to LPs.
-/// @dev Flow:
-///   1. The market for the underlying (e.g. NVDA) reopens. The pool still sits at the stale close price.
+///         One hook serves any number of pools; all state is keyed by PoolId.
+/// @dev Flow (per pool):
+///   1. The off-chain market for the pool's underlying reopens. The pool still sits at the stale close price.
 ///   2. The keeper calls `startAuction(key, refSqrtPriceX96)`. The pool locks: public swaps and
 ///      liquidity adds revert.
 ///   3. A Dutch auction runs for `auctionBlocks` blocks. The price starts at `startBid` (an on-chain
@@ -28,7 +29,7 @@ import {FixedPoint96} from "@uniswap/v4-core/src/libraries/FixedPoint96.sol";
 ///   4. The first caller of `bidAndSwap` pays the current price and swaps in the same transaction.
 ///      The hook donates the bid to in-range LPs and reopens the pool.
 ///   5. If no one bids before `endBlock`, the pool reopens on its own.
-///   Bids are paid in the pool's quote currency (`quoteIsCurrency0[poolId]`, default currency1).
+///   Bids are paid in currency1 by default, or currency0 when `bidInCurrency0[poolId]` is set.
 contract ReopenAuctionHook is BaseHook, IUnlockCallback {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
@@ -78,7 +79,7 @@ contract ReopenAuctionHook is BaseHook, IUnlockCallback {
     event AuctionCancelled(PoolId indexed poolId);
     event KeeperSet(address keeper);
     event ConfigSet(uint64 auctionBlocks, uint32 startPremiumBps);
-    event QuoteCurrencySet(PoolId indexed poolId, bool quoteIsCurrency0);
+    event BidCurrencySet(PoolId indexed poolId, bool bidInCurrency0);
 
     // ------------------------------------------------------------------
     // Storage
@@ -93,7 +94,7 @@ contract ReopenAuctionHook is BaseHook, IUnlockCallback {
     uint32 public startPremiumBps;
 
     mapping(PoolId => Auction) public auctions;
-    mapping(PoolId => bool) public quoteIsCurrency0;
+    mapping(PoolId => bool) public bidInCurrency0;
 
     constructor(IPoolManager _poolManager, address _owner, address _keeper, uint64 _auctionBlocks, uint32 _premiumBps)
         BaseHook(_poolManager)
@@ -148,9 +149,9 @@ contract ReopenAuctionHook is BaseHook, IUnlockCallback {
         emit ConfigSet(_auctionBlocks, _premiumBps);
     }
 
-    function setQuoteCurrency(PoolKey calldata key, bool _quoteIsCurrency0) external onlyOwner {
-        quoteIsCurrency0[key.toId()] = _quoteIsCurrency0;
-        emit QuoteCurrencySet(key.toId(), _quoteIsCurrency0);
+    function setBidCurrency(PoolKey calldata key, bool _bidInCurrency0) external onlyOwner {
+        bidInCurrency0[key.toId()] = _bidInCurrency0;
+        emit BidCurrencySet(key.toId(), _bidInCurrency0);
     }
 
     function transferOwnership(address newOwner) external onlyOwner {
@@ -169,7 +170,8 @@ contract ReopenAuctionHook is BaseHook, IUnlockCallback {
     // Keeper: lock the pool at market reopen
     // ------------------------------------------------------------------
 
-    /// @param refSqrtPriceX96 The reopen reference price (e.g. NVDA's first print), in the pool's sqrtPriceX96 units.
+    /// @param refSqrtPriceX96 The reopen reference price (the underlying's first print), as a sqrtPriceX96
+    ///        (currency1 per currency0, raw units, Q64.96).
     function startAuction(PoolKey calldata key, uint160 refSqrtPriceX96) external onlyKeeper returns (uint256 startBid) {
         if (refSqrtPriceX96 == 0) revert InvalidRefPrice();
         PoolId id = key.toId();
@@ -195,7 +197,7 @@ contract ReopenAuctionHook is BaseHook, IUnlockCallback {
     // ------------------------------------------------------------------
 
     /// @notice Pay the current Dutch price, swap, donate the payment to LPs, reopen the pool.
-    /// @dev The bidder must approve this hook for the input currency and the quote currency.
+    /// @dev The bidder must approve this hook for the swap's input currency and the bid currency.
     ///      Use `params.sqrtPriceLimitX96` for slippage protection on the swap.
     /// @param maxBid Revert if the current price is above this.
     function bidAndSwap(PoolKey calldata key, SwapParams calldata params, uint256 maxBid)
@@ -218,7 +220,7 @@ contract ReopenAuctionHook is BaseHook, IUnlockCallback {
             (BalanceDelta)
         );
 
-        emit AuctionWon(id, msg.sender, bid, _quote(key), swapDelta);
+        emit AuctionWon(id, msg.sender, bid, bidCurrency(key), swapDelta);
     }
 
     function unlockCallback(bytes calldata raw) external onlyPoolManager returns (bytes memory) {
@@ -229,7 +231,7 @@ contract ReopenAuctionHook is BaseHook, IUnlockCallback {
 
         // Pay the bid to LPs in range at the new (post-arb) price.
         if (d.bid > 0) {
-            if (quoteIsCurrency0[d.key.toId()]) poolManager.donate(d.key, d.bid, 0, "");
+            if (bidInCurrency0[d.key.toId()]) poolManager.donate(d.key, d.bid, 0, "");
             else poolManager.donate(d.key, 0, d.bid, "");
         }
 
@@ -290,7 +292,7 @@ contract ReopenAuctionHook is BaseHook, IUnlockCallback {
     /// @notice Profit from moving the pool from its current price to `refSqrtPriceX96`, assuming the
     ///         current in-range liquidity holds across the move. Exact for full-range positions.
     /// @dev With liquidity L and sqrt prices a (pool) and b (ref), profit in currency1 = L * (b - a)^2 / a.
-    ///      Converted to currency0 at the ref price when the pool's quote is currency0.
+    ///      Converted to currency0 at the ref price when the pool bids in currency0.
     function estimateArbProfit(PoolKey calldata key, uint160 refSqrtPriceX96) public view returns (uint256 profit) {
         PoolId id = key.toId();
         (uint160 a,,,) = poolManager.getSlot0(id);
@@ -301,7 +303,7 @@ contract ReopenAuctionHook is BaseHook, IUnlockCallback {
         // profit1 = L * diff^2 / (a * 2^96)
         profit = FullMath.mulDiv(FullMath.mulDiv(liquidity, diff, a), diff, FixedPoint96.Q96);
 
-        if (quoteIsCurrency0[id]) {
+        if (bidInCurrency0[id]) {
             // profit0 = profit1 / p_ref = profit1 * 2^192 / b^2
             profit = FullMath.mulDiv(FullMath.mulDiv(profit, FixedPoint96.Q96, b), FixedPoint96.Q96, b);
         }
@@ -311,7 +313,7 @@ contract ReopenAuctionHook is BaseHook, IUnlockCallback {
         return a.active && block.number <= a.endBlock;
     }
 
-    function _quote(PoolKey calldata key) internal view returns (Currency) {
-        return quoteIsCurrency0[key.toId()] ? key.currency0 : key.currency1;
+    function bidCurrency(PoolKey calldata key) public view returns (Currency) {
+        return bidInCurrency0[key.toId()] ? key.currency0 : key.currency1;
     }
 }

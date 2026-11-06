@@ -6,6 +6,7 @@ import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {CustomRevert} from "@uniswap/v4-core/src/libraries/CustomRevert.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {IPositionManager} from "@uniswap/v4-periphery/src/interfaces/IPositionManager.sol";
@@ -20,16 +21,24 @@ import {ReopenAuctionHook} from "../src/ReopenAuctionHook.sol";
 ///   2. Reopen: the keeper starts the auction; public swaps and LP adds revert; price falls block by block.
 ///   3. Win: the bidder pays the Dutch price, arbs to the ref price, the bid lands with LPs, the pool reopens.
 ///   4. Edge cases: no bid (auction expires), maxBid guard, access control, cancel.
+///   Multi-pool: one hook runs independent auctions on pools with different decimals, prices, fees and gaps.
 contract ReopenAuctionHookTest is AuctionFixture {
     using EasyPosm for IPositionManager;
     using StateLibrary for IPoolManager;
 
-    uint256 constant CLOSE_PRICE = 180; // NVDA Friday close
-    uint256 constant REOPEN_PRICE = 190; // NVDA Monday open
+    uint256 constant INITIAL_PRICE = 180e18; // currency1 per currency0 at market close
+    uint256 constant REF_PRICE = 190e18; // first print at market reopen
+
+    PoolInfo pool; // the default pool used by scenes 1-4
 
     function setUp() public {
-        _setUpPool(CLOSE_PRICE);
+        _deployHook();
+        pool = _createPool(defaultPair(INITIAL_PRICE));
     }
+
+    // ------------------------------------------------------------------
+    // Helpers
+    // ------------------------------------------------------------------
 
     function _wrappedHookRevert(bytes4 hookSelector) internal view returns (bytes memory) {
         return abi.encodeWithSelector(
@@ -41,25 +50,25 @@ contract ReopenAuctionHookTest is AuctionFixture {
         );
     }
 
-    function _publicSwap(address who, bool zeroForOne, uint256 amountIn) internal returns (BalanceDelta) {
-        vm.prank(who);
+    function _publicSwap(PoolInfo memory p, bool zeroForOne, uint256 amountIn) internal returns (BalanceDelta) {
+        vm.prank(trader);
         return swapRouter.swapExactTokensForTokens({
             amountIn: amountIn,
             amountOutMin: 0,
             zeroForOne: zeroForOne,
-            poolKey: poolKey,
+            poolKey: p.key,
             hookData: Constants.ZERO_BYTES,
-            receiver: who,
+            receiver: trader,
             deadline: block.timestamp + 1
         });
     }
 
     /// @dev External so `expectRevert` covers the whole mint (EasyPosm makes calls before the revert).
-    function addFullRangeLiquidity(uint128 liquidity) external {
+    function addFullRangeLiquidity(PoolInfo memory p, uint128 liquidity) external {
         positionManager.mint(
-            poolKey,
-            TickMath.minUsableTick(TICK_SPACING),
-            TickMath.maxUsableTick(TICK_SPACING),
+            p.key,
+            TickMath.minUsableTick(p.key.tickSpacing),
+            TickMath.maxUsableTick(p.key.tickSpacing),
             liquidity,
             type(uint256).max,
             type(uint256).max,
@@ -69,9 +78,56 @@ contract ReopenAuctionHookTest is AuctionFixture {
         );
     }
 
-    function _startAuction() internal returns (uint256 startBid) {
+    function _startAuction(PoolInfo memory p, uint256 refPrice) internal returns (uint256 startBid) {
+        uint160 ref = toSqrtPriceX96(p, refPrice);
         vm.prank(keeper);
-        startBid = hook.startAuction(poolKey, toSqrtPriceX96(REOPEN_PRICE));
+        startBid = hook.startAuction(p.key, ref);
+    }
+
+    function _bid(PoolInfo memory p, uint256 refPrice, uint256 maxBid)
+        internal
+        returns (BalanceDelta swapDelta, uint256 bid)
+    {
+        SwapParams memory params = arbParams(p, toSqrtPriceX96(p, refPrice));
+        vm.prank(bidder);
+        (swapDelta, bid) = hook.bidAndSwap(p.key, params, maxBid);
+    }
+
+    function _assertOpen(PoolInfo memory p) internal view {
+        assertEq(uint8(hook.phase(p.id)), uint8(ReopenAuctionHook.Phase.OPEN));
+    }
+
+    function _assertAuction(PoolInfo memory p) internal view {
+        assertEq(uint8(hook.phase(p.id)), uint8(ReopenAuctionHook.Phase.AUCTION));
+    }
+
+    /// @dev Full winning path on `p`: bid, then check price, bidder P&L and LP payout.
+    function _winAndCheck(PoolInfo memory p, uint256 refPrice) internal returns (uint256 bid) {
+        uint160 ref = toSqrtPriceX96(p, refPrice);
+        bool bidIn0 = hook.bidInCurrency0(p.id);
+
+        uint256 b0 = p.key.currency0.balanceOf(bidder);
+        uint256 b1 = p.key.currency1.balanceOf(bidder);
+
+        BalanceDelta swapDelta;
+        (swapDelta, bid) = _bid(p, refPrice, type(uint256).max);
+        assertGt(bid, 0, "bid");
+
+        // Pool lands exactly on the reference price and reopens.
+        assertEq(sqrtPriceOf(p), ref, "price at ref");
+        _assertOpen(p);
+
+        // Bidder paid swap input + bid, and still profits when marked at the reference price.
+        int256 d0 = int256(p.key.currency0.balanceOf(bidder)) - int256(b0);
+        int256 d1 = int256(p.key.currency1.balanceOf(bidder)) - int256(b1);
+        assertEq(d0, int256(swapDelta.amount0()) - (bidIn0 ? int256(bid) : int256(0)), "bidder d0");
+        assertEq(d1, int256(swapDelta.amount1()) - (bidIn0 ? int256(0) : int256(bid)), "bidder d1");
+        assertGt(valueIn1(d0, d1, ref), 0, "bidder profit");
+
+        // LPs collect at least the bid in the bid currency.
+        BalanceDelta fees = positionManager.collect(p.lpTokenId, 0, 0, address(this), block.timestamp, "");
+        uint256 collected = uint256(int256(bidIn0 ? fees.amount0() : fees.amount1()));
+        assertGe(collected + 1, bid, "LP payout");
     }
 
     // ------------------------------------------------------------------
@@ -79,8 +135,8 @@ contract ReopenAuctionHookTest is AuctionFixture {
     // ------------------------------------------------------------------
 
     function test_scene1_openMarketSwapsNormally() public {
-        assertEq(uint8(hook.phase(poolId)), uint8(ReopenAuctionHook.Phase.OPEN));
-        BalanceDelta d = _publicSwap(trader, true, 1e18);
+        _assertOpen(pool);
+        BalanceDelta d = _publicSwap(pool, true, 1e18);
         assertEq(d.amount0(), -1e18);
         assertGt(d.amount1(), 0);
     }
@@ -90,33 +146,33 @@ contract ReopenAuctionHookTest is AuctionFixture {
     // ------------------------------------------------------------------
 
     function test_scene2_startAuctionLocksPool() public {
-        uint256 startBid = _startAuction();
+        uint160 ref = toSqrtPriceX96(pool, REF_PRICE);
+        uint256 estimate = hook.estimateArbProfit(pool.key, ref);
+        uint256 startBid = _startAuction(pool, REF_PRICE);
 
-        // L * (b - a)^2 / a with L = 10_000, sqrt(180) -> sqrt(190): ~101 USDG, times 1.5 premium.
-        assertApproxEqRel(startBid, 151.4e18, 0.01e18);
-        assertEq(uint8(hook.phase(poolId)), uint8(ReopenAuctionHook.Phase.AUCTION));
+        assertEq(startBid, estimate * PREMIUM_BPS / 10_000);
+        _assertAuction(pool);
 
-        // Public swaps revert.
         vm.expectRevert(_wrappedHookRevert(IHooks.beforeSwap.selector));
-        _publicSwap(trader, false, 1000e18);
+        _publicSwap(pool, false, 1000e18);
 
         // JIT liquidity is blocked.
         vm.expectRevert(_wrappedHookRevert(IHooks.beforeAddLiquidity.selector));
-        this.addFullRangeLiquidity(1e18);
+        this.addFullRangeLiquidity(pool, 1e18);
 
         // Cannot start a second auction on top.
         vm.prank(keeper);
         vm.expectRevert(ReopenAuctionHook.AuctionActive.selector);
-        hook.startAuction(poolKey, toSqrtPriceX96(REOPEN_PRICE));
+        hook.startAuction(pool.key, ref);
     }
 
     function test_scene2_priceFallsBlockByBlock() public {
-        uint256 startBid = _startAuction();
-        uint256 last = hook.currentPrice(poolId);
+        uint256 startBid = _startAuction(pool, REF_PRICE);
+        uint256 last = hook.currentPrice(pool.id);
         assertEq(last, startBid);
         for (uint256 i = 1; i <= AUCTION_BLOCKS; i++) {
             vm.roll(block.number + 1);
-            uint256 p = hook.currentPrice(poolId);
+            uint256 p = hook.currentPrice(pool.id);
             assertLt(p, last);
             assertEq(p, startBid * (AUCTION_BLOCKS - i) / AUCTION_BLOCKS);
             last = p;
@@ -129,61 +185,33 @@ contract ReopenAuctionHookTest is AuctionFixture {
     // ------------------------------------------------------------------
 
     function test_scene3_winnerArbsAndBidGoesToLPs() public {
-        _startAuction();
-        // At 1.5x the fee-free estimate, the first blocks are unprofitable once the 0.3% swap fee is paid.
+        _startAuction(pool, REF_PRICE);
+        // At 1.5x the fee-free estimate, the first blocks are unprofitable once the swap fee is paid.
         // A rational bidder waits until the price drops below its real profit: block 5 = 50% of start.
         vm.roll(block.number + 5);
-
-        uint256 price = hook.currentPrice(poolId);
-        uint160 ref = toSqrtPriceX96(REOPEN_PRICE);
-
-        uint256 nvdaBefore = _bal(xNVDA, bidder);
-        uint256 usdgBefore = _bal(usdg, bidder);
-
-        SwapParams memory params = arbParams(ref);
-        vm.prank(bidder);
-        (BalanceDelta swapDelta, uint256 bid) = hook.bidAndSwap(poolKey, params, price);
-
+        uint256 price = hook.currentPrice(pool.id);
+        uint256 bid = _winAndCheck(pool, REF_PRICE);
         assertEq(bid, price);
-        assertGt(bid, 0);
+        _publicSwap(pool, true, 1e18);
+    }
 
-        // Pool moved to the reference price.
-        (uint160 sqrtAfter,,,) = poolManager.getSlot0(poolId);
-        assertEq(sqrtAfter, ref);
-
-        // Bidder bought xNVDA with USDG and paid swap input + bid.
-        int256 dNvda = int256(_bal(xNVDA, bidder)) - int256(nvdaBefore);
-        int256 dUsdg = int256(_bal(usdg, bidder)) - int256(usdgBefore);
-        assertEq(dNvda, int256(swapDelta.amount0()));
-        assertEq(dUsdg, int256(swapDelta.amount1()) - int256(bid));
-
-        // Bidder still profits when xNVDA is marked at the reopen price.
-        assertGt(_pnlAtRef(dNvda, dUsdg, REOPEN_PRICE), 0);
-
-        // LPs collect the bid plus the normal swap fee.
-        uint256 swapFee = uint256(-int256(swapDelta.amount1())) * FEE / 1e6;
-        BalanceDelta fees = positionManager.collect(lpTokenId, 0, 0, address(this), block.timestamp, "");
-        assertApproxEqAbs(uint256(int256(fees.amount1())), bid + swapFee, 1e6);
-
-        // Pool is open again.
-        assertEq(uint8(hook.phase(poolId)), uint8(ReopenAuctionHook.Phase.OPEN));
-        _publicSwap(trader, true, 1e18);
+    function test_scene3_estimateMatchesRealizedArb() public {
+        // Gross arb (after fee, before bid) + swap fee ~= on-chain estimate for a full-range pool.
+        uint160 ref = toSqrtPriceX96(pool, REF_PRICE);
+        uint256 estimate = hook.estimateArbProfit(pool.key, ref);
+        _startAuction(pool, REF_PRICE);
+        vm.roll(block.number + AUCTION_BLOCKS); // price 0, isolate the swap
+        (BalanceDelta d, uint256 bid) = _bid(pool, REF_PRICE, type(uint256).max);
+        assertEq(bid, 0);
+        uint256 fee = uint256(-int256(d.amount1())) * DEFAULT_FEE / 1e6;
+        int256 gross = valueIn1(d.amount0(), d.amount1(), ref);
+        assertApproxEqRel(uint256(gross) + fee, estimate, 0.01e18);
     }
 
     function test_scene3_priceDownGap() public {
-        // Reopen below the close: winner sells xNVDA.
-        vm.prank(keeper);
-        uint160 ref = toSqrtPriceX96(170);
-        uint256 startBid = hook.startAuction(poolKey, ref);
-        assertGt(startBid, 0);
-
-        SwapParams memory params = arbParams(ref);
-        vm.prank(bidder);
-        (BalanceDelta d, uint256 bid) = hook.bidAndSwap(poolKey, params, type(uint256).max);
-        assertEq(bid, startBid);
-        assertLt(d.amount0(), 0);
-        (uint160 sqrtAfter,,,) = poolManager.getSlot0(poolId);
-        assertEq(sqrtAfter, ref);
+        assertGt(_startAuction(pool, 170e18), 0);
+        vm.roll(block.number + 6);
+        _winAndCheck(pool, 170e18);
     }
 
     // ------------------------------------------------------------------
@@ -191,64 +219,109 @@ contract ReopenAuctionHookTest is AuctionFixture {
     // ------------------------------------------------------------------
 
     function test_scene4_noBidPoolReopensAfterExpiry() public {
-        _startAuction();
+        _startAuction(pool, REF_PRICE);
         vm.roll(block.number + AUCTION_BLOCKS + 1);
-        assertEq(uint8(hook.phase(poolId)), uint8(ReopenAuctionHook.Phase.OPEN));
-        assertEq(hook.currentPrice(poolId), 0);
-        _publicSwap(trader, false, 1000e18);
+        _assertOpen(pool);
+        assertEq(hook.currentPrice(pool.id), 0);
+        _publicSwap(pool, false, 1000e18);
 
-        SwapParams memory params = arbParams(toSqrtPriceX96(REOPEN_PRICE));
+        SwapParams memory params = arbParams(pool, toSqrtPriceX96(pool, REF_PRICE));
         vm.prank(bidder);
         vm.expectRevert(ReopenAuctionHook.NoActiveAuction.selector);
-        hook.bidAndSwap(poolKey, params, type(uint256).max);
+        hook.bidAndSwap(pool.key, params, type(uint256).max);
     }
 
     function test_scene4_maxBidGuard() public {
-        uint256 startBid = _startAuction();
-        SwapParams memory params = arbParams(toSqrtPriceX96(REOPEN_PRICE));
+        uint256 startBid = _startAuction(pool, REF_PRICE);
+        SwapParams memory params = arbParams(pool, toSqrtPriceX96(pool, REF_PRICE));
         vm.prank(bidder);
         vm.expectRevert(abi.encodeWithSelector(ReopenAuctionHook.BidTooHigh.selector, startBid, startBid - 1));
-        hook.bidAndSwap(poolKey, params, startBid - 1);
+        hook.bidAndSwap(pool.key, params, startBid - 1);
     }
 
     function test_scene4_onlyKeeperStarts() public {
-        uint160 ref = toSqrtPriceX96(REOPEN_PRICE);
+        uint160 ref = toSqrtPriceX96(pool, REF_PRICE);
         vm.prank(trader);
         vm.expectRevert(ReopenAuctionHook.NotKeeper.selector);
-        hook.startAuction(poolKey, ref);
+        hook.startAuction(pool.key, ref);
     }
 
     function test_scene4_ownerCancelReopens() public {
-        _startAuction();
-        hook.cancelAuction(poolKey);
-        assertEq(uint8(hook.phase(poolId)), uint8(ReopenAuctionHook.Phase.OPEN));
-        _publicSwap(trader, true, 1e18);
+        _startAuction(pool, REF_PRICE);
+        hook.cancelAuction(pool.key);
+        _assertOpen(pool);
+        _publicSwap(pool, true, 1e18);
     }
 
     function test_scene4_secondBidderLoses() public {
-        _startAuction();
-        SwapParams memory params = arbParams(toSqrtPriceX96(REOPEN_PRICE));
-        vm.prank(bidder);
-        hook.bidAndSwap(poolKey, params, type(uint256).max);
+        _startAuction(pool, REF_PRICE);
+        _bid(pool, REF_PRICE, type(uint256).max);
 
+        SwapParams memory params = arbParams(pool, toSqrtPriceX96(pool, REF_PRICE));
         vm.prank(trader);
         vm.expectRevert(ReopenAuctionHook.NoActiveAuction.selector);
-        hook.bidAndSwap(poolKey, params, type(uint256).max);
+        hook.bidAndSwap(pool.key, params, type(uint256).max);
     }
 
-    function test_scene4_quoteInCurrency0() public {
-        hook.setQuoteCurrency(poolKey, true);
-        uint160 ref = toSqrtPriceX96(REOPEN_PRICE);
-        uint256 profit1 = 101e18; // ~USDG profit, see scene 2
-        uint256 est0 = hook.estimateArbProfit(poolKey, ref);
-        assertApproxEqRel(est0, profit1 / REOPEN_PRICE, 0.01e18);
+    function test_scene4_bidInCurrency0() public {
+        uint160 ref = toSqrtPriceX96(pool, REF_PRICE);
+        uint256 estimate1 = hook.estimateArbProfit(pool.key, ref);
+        hook.setBidCurrency(pool.key, true);
+        uint256 estimate0 = hook.estimateArbProfit(pool.key, ref);
+        assertApproxEqRel(estimate0, estimate1 * 1e18 / REF_PRICE, 0.001e18);
 
-        vm.prank(keeper);
-        hook.startAuction(poolKey, ref);
-        SwapParams memory params = arbParams(ref);
-        vm.prank(bidder);
-        (, uint256 bid) = hook.bidAndSwap(poolKey, params, type(uint256).max);
-        BalanceDelta fees = positionManager.collect(lpTokenId, 0, 0, address(this), block.timestamp, "");
-        assertGe(uint256(int256(fees.amount0())), bid - 1);
+        _startAuction(pool, REF_PRICE);
+        vm.roll(block.number + 6);
+        _winAndCheck(pool, REF_PRICE);
+    }
+
+    // ------------------------------------------------------------------
+    // Multi-pool: one hook, many pairs
+    // ------------------------------------------------------------------
+
+    function test_multiPool_independentAuctions() public {
+        // pools[0] is the default 18/18 pool from setUp. Add four more with different shapes.
+        PairConfig[4] memory cfgs = [
+            // 18/6 decimals, price falls 4%
+            PairConfig({decimals0: 18, decimals1: 6, price: 2500e18, liquidityValue1: 2_000_000, fee: 3000, tickSpacing: 60}),
+            // 6/18 decimals, sub-1 price, rises 5%
+            PairConfig({decimals0: 6, decimals1: 18, price: 0.0004e18, liquidityValue1: 100_000, fee: 3000, tickSpacing: 60}),
+            // 8/18 decimals, large price, falls ~4.6%
+            PairConfig({decimals0: 8, decimals1: 18, price: 65_000e18, liquidityValue1: 5_000_000, fee: 3000, tickSpacing: 60}),
+            // 18/18, low fee tier, rises ~6.7%
+            PairConfig({decimals0: 18, decimals1: 18, price: 1.5e18, liquidityValue1: 500_000, fee: 500, tickSpacing: 10})
+        ];
+        uint256[5] memory refs = [REF_PRICE, 2400e18, 0.00042e18, 62_000e18, 1.6e18];
+
+        for (uint256 i; i < cfgs.length; i++) {
+            _createPool(cfgs[i]);
+        }
+        assertEq(pools.length, 5);
+
+        // Pool 4 pays its bid in currency0.
+        hook.setBidCurrency(pools[4].key, true);
+
+        // Market reopens: the keeper locks every pool.
+        for (uint256 i; i < pools.length; i++) {
+            assertGt(_startAuction(pools[i], refs[i]), 0);
+            _assertAuction(pools[i]);
+        }
+
+        // Pool 2 clears early; the others stay locked.
+        vm.roll(block.number + 6);
+        _winAndCheck(pools[2], refs[2]);
+        for (uint256 i; i < pools.length; i++) {
+            if (i != 2) _assertAuction(pools[i]);
+        }
+        vm.expectRevert(_wrappedHookRevert(IHooks.beforeSwap.selector));
+        _publicSwap(pools[0], true, 1e18);
+
+        // Each remaining pool clears on its own.
+        for (uint256 i; i < pools.length; i++) {
+            if (i != 2) _winAndCheck(pools[i], refs[i]);
+        }
+        for (uint256 i; i < pools.length; i++) {
+            _assertOpen(pools[i]);
+        }
     }
 }
