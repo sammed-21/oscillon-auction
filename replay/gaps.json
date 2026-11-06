@@ -1,0 +1,68 @@
+{
+  "_readme": [
+    "PLACEHOLDER DATA - illustrative close/open gaps, not real market history. Replace with real prints.",
+    "One entry per pair. Uniswap conventions: currency0 < currency1, prices are currency1 per currency0.",
+    "decimals0 / decimals1: token decimals of currency0 / currency1.",
+    "bidInCurrency0: true when the stable (the currency bids and results are measured in) is currency0.",
+    "liquidityValue1: full-range position size in whole currency1 tokens (about half sits on each side).",
+    "closesE6[i] / opensE6[i]: price at market close and at the next reopen, scaled by 1e6.",
+    "Between events the pool is moved to the next close, as if arbs kept it aligned during market hours."
+  ],
+  "pairs": [
+    {
+      "label": "pair0",
+      "decimals0": 18,
+      "decimals1": 18,
+      "fee": 3000,
+      "tickSpacing": 60,
+      "liquidityValue1": 1000000,
+      "bidInCurrency0": false,
+      "closesE6": [180000000, 186200000, 177500000, 191000000, 188400000, 172900000, 179600000, 184300000],
+      "opensE6":  [186500000, 178900000, 183100000, 189700000, 176200000, 180400000, 179900000, 191800000]
+    },
+    {
+      "label": "pair1",
+      "decimals0": 18,
+      "decimals1": 6,
+      "fee": 3000,
+      "tickSpacing": 60,
+      "liquidityValue1": 2000000,
+      "bidInCurrency0": false,
+      "closesE6": [250000000, 242000000, 246500000, 239000000, 251000000, 247500000, 244000000, 252000000],
+      "opensE6":  [241000000, 247000000, 238000000, 250500000, 248000000, 244500000, 252500000, 246000000]
+    },
+    {
+      "label": "pair2",
+      "decimals0": 6,
+      "decimals1": 18,
+      "fee": 3000,
+      "tickSpacing": 60,
+      "liquidityValue1": 4000,
+      "bidInCurrency0": true,
+      "closesE6": [4000, 4180, 4050, 3960, 4100, 4020, 3890, 4070],
+      "opensE6":  [4200, 4040, 3980, 4110, 4010, 3880, 4080, 3950]
+    },
+    {
+      "label": "pair3",
+      "decimals0": 8,
+      "decimals1": 18,
+      "fee": 3000,
+      "tickSpacing": 60,
+      "liquidityValue1": 5000000,
+      "bidInCurrency0": false,
+      "closesE6": [420000000, 401000000, 412500000, 399000000, 415000000, 430000000, 419000000, 409000000],
+      "opensE6":  [400500000, 413000000, 398500000, 415500000, 431000000, 418500000, 408000000, 421000000]
+    },
+    {
+      "label": "pair4",
+      "decimals0": 18,
+      "decimals1": 6,
+      "fee": 500,
+      "tickSpacing": 10,
+      "liquidityValue1": 500000,
+      "bidInCurrency0": false,
+      "closesE6": [95000000, 99100000, 96400000, 94200000, 98300000, 100900000, 96200000, 97800000],
+      "opensE6":  [99300000, 96000000, 94100000, 98500000, 101200000, 96000000, 97500000, 102100000]
+    }
+  ]
+}

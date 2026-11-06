@@ -14,6 +14,7 @@ import {IPositionManager} from "@uniswap/v4-periphery/src/interfaces/IPositionMa
 import {Constants} from "@uniswap/v4-core/test/utils/Constants.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
+import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 
 import {EasyPosm} from "./libraries/EasyPosm.sol";
 import {BaseTest} from "./BaseTest.sol";
@@ -59,6 +60,8 @@ abstract contract AuctionFixture is BaseTest {
     address trader = makeAddr("trader");
 
     ReopenAuctionHook hook;
+    /// @dev Swap router that accepts full SwapParams (exact price limits). Used for arbs on hookless pools.
+    PoolSwapTest swapTest;
     PoolInfo[] pools;
 
     // ------------------------------------------------------------------
@@ -75,6 +78,7 @@ abstract contract AuctionFixture is BaseTest {
             flags
         );
         hook = ReopenAuctionHook(flags);
+        swapTest = new PoolSwapTest(poolManager);
     }
 
     function defaultPair(uint256 price) internal pure returns (PairConfig memory) {
@@ -91,8 +95,15 @@ abstract contract AuctionFixture is BaseTest {
     /// @notice Deploy a fresh token pair, create its pool on the hook and add full-range liquidity.
     function _createPool(PairConfig memory cfg) internal returns (PoolInfo memory p) {
         (Currency currency0, Currency currency1) = _deployPair(cfg.decimals0, cfg.decimals1);
+        return _createPool(cfg, currency0, currency1, IHooks(hook));
+    }
 
-        p.key = PoolKey(currency0, currency1, cfg.fee, cfg.tickSpacing, IHooks(hook));
+    /// @notice Create a pool for an existing pair with any hook (address(0) for a vanilla pool).
+    function _createPool(PairConfig memory cfg, Currency currency0, Currency currency1, IHooks hooks)
+        internal
+        returns (PoolInfo memory p)
+    {
+        p.key = PoolKey(currency0, currency1, cfg.fee, cfg.tickSpacing, hooks);
         p.id = p.key.toId();
         p.decimals0 = cfg.decimals0;
         p.decimals1 = cfg.decimals1;
@@ -147,6 +158,7 @@ abstract contract AuctionFixture is BaseTest {
         vm.startPrank(who);
         token.approve(address(hook), type(uint256).max);
         token.approve(address(swapRouter), type(uint256).max);
+        token.approve(address(swapTest), type(uint256).max);
         token.approve(address(permit2), type(uint256).max);
         permit2.approve(address(token), address(positionManager), type(uint160).max, type(uint48).max);
         vm.stopPrank();
