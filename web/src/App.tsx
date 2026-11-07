@@ -276,7 +276,7 @@ export function App() {
           <span className="mark" aria-hidden>
             ◐
           </span>
-          <span className="wordmark">Reopen</span>
+          <span className="wordmark">Oscillon Bell</span>
           <span className="tag">auction hook · Uniswap v4</span>
         </div>
         <div className="topbar-right">
@@ -381,7 +381,7 @@ export function App() {
       </section>
 
       <footer className="foot">
-        <span>Reopen Auction Hook · ETHGlobal</span>
+        <span>Oscillon Bell · ReopenAuctionHook · ETHGlobal</span>
         <span className="muted">RPC {RPC_URL}</span>
       </footer>
 
