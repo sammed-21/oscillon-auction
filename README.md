@@ -1,183 +1,115 @@
-# Uniswap v4 Hook Template
+# Reopen Auction Hook
 
-**A template for writing Uniswap v4 Hooks 🦄**
+**A Uniswap v4 hook that auctions the first swap after a market reopen and pays the winning bid to LPs.**
 
-### Get Started
+Tokenized stocks trade on-chain 24/7, but their real market closes every night and weekend. When it reopens, the
+underlying price jumps and the pool still sits at the stale close price. Whoever swaps first takes the whole gap
+from LPs. That is pure loss-versus-rebalancing (LVR), and it happens on every pool at every open.
 
-This template provides a starting point for writing Uniswap v4 Hooks, including a simple example and preconfigured test environment. Start by creating a new repository using the "Use this template" button at the top right of this page. Alternatively you can also click this link:
+This hook turns that race into a sale:
 
-[![Use this Template](https://img.shields.io/badge/Use%20this%20Template-101010?style=for-the-badge&logo=github)](https://github.com/uniswapfoundation/v4-template/generate)
+1. **Lock.** At reopen, the keeper calls `startAuction(key, refPrice)`. Public swaps and liquidity adds revert.
+2. **Dutch auction.** The price starts at 1.5x an on-chain estimate of the arb profit and falls to 0 block by block.
+3. **Win.** The first `bidAndSwap` pays the current price, swaps the pool to the reference price, and donates the
+   bid to in-range LPs, all in one transaction.
+4. **Reopen.** The pool is open again. If nobody bids, it reopens on its own when the auction ends.
 
-1. The example hook [Counter.sol](src/Counter.sol) demonstrates the `beforeSwap()` and `afterSwap()` hooks
-2. The test template [Counter.t.sol](test/Counter.t.sol) preconfigures the v4 pool manager, test tokens, and test liquidity.
+One hook serves any number of pools. All state is keyed by `PoolId`.
 
-<details>
-<summary>Updating to v4-template:latest</summary>
+```
+Keeper ──startAuction(key, ref)──▶ ReopenAuctionHook ◀──bidAndSwap(key, params, maxBid)── Bidder
+                                        │  locks pool, Dutch price falls per block
+                                        ▼
+                         PoolManager.unlock → swap → donate(bid) → settle with bidder
+                                        │  events: AuctionStarted, AuctionWon
+                                        ▼
+                                LPs collect the bid as fees
+```
 
-This template is actively maintained -- you can update the v4 dependencies, scripts, and helpers:
+## Result
+
+`forge test --match-contract ReplayTest -vv` replays close→open gaps through a vanilla pool and an auction pool built
+on the same tokens:
+
+```
+events: 40 | profitable gaps: 39
+VANILLA  arbs extract 9459.59 | LPs get 1751.75
+AUCTION  winners keep 920.77  | LPs get 10290.57 (bids 8538.82)
+RECAPTURED for LPs: 90.26% of reopen arbitrage
+```
+
+> The gaps in `replay/gaps.json` are **illustrative placeholder data**, not market history. Swap in real
+> close/open prints to get real numbers. No code changes are needed. Per-event output goes to `replay/results.csv`.
+
+LPs don't get the remaining ~10% because of the price steps: with 10 blocks, each block drops the price by 15% of
+the start, and the winner keeps up to one step. Longer auctions or a smaller premium (`setConfig`) raise recapture.
+
+## How it works
+
+| Piece | Where |
+|---|---|
+| Lock: `beforeSwap` and `beforeAddLiquidity` revert while an auction is live | `_beforeSwap`, `_beforeAddLiquidity` |
+| Start price: `L·(√P_ref − √P_pool)² / √P_pool` × `startPremiumBps` (exact for full-range liquidity) | `estimateArbProfit` |
+| Dutch price: `startBid · (endBlock − block) / auctionBlocks` | `currentPrice` |
+| Winner's swap: the hook is `msg.sender` to the PoolManager, so v4 skips the hook's own `beforeSwap` | `unlockCallback` |
+| Payout: `donate(bid)` after the swap, so LPs in range at the new price get it | `unlockCallback` |
+| Bid currency: currency1 by default, `setBidCurrency(key, true)` for currency0 | `bidInCurrency0` |
+
+## Layout
+
+```
+src/ReopenAuctionHook.sol          the hook (auction lives inside it)
+test/ReopenAuctionHook.t.sol       scenes 1-4 + 5-pool test (mixed decimals, fee tiers, gap directions)
+test/Replay.t.sol                  scene 5: vanilla vs auction replay -> replay/results.csv
+test/utils/AuctionFixture.sol      generic multi-pair fixture (currency0/currency1, any decimals)
+script/Deploy.s.sol                mine + deploy hook, mock pairs, pools, liquidity -> deployments/<chainId>.json
+script/StartAuction.s.sol          keeper: lock a pool at reopen
+script/Bid.s.sol                   bidder: win the auction and arb
+script/Status.s.sol                phase / Dutch price / pool price for every pool
+replay/gaps.json                   pair config + close/open gaps (used by the replay and by Deploy)
+```
+
+## Run it
 
 ```bash
-git remote add template https://github.com/uniswapfoundation/v4-template
-git fetch template
-git merge template/main <BRANCH> --allow-unrelated-histories
+forge test                                   # 22 tests
+forge test --match-contract ReplayTest -vv   # the comparison table
 ```
 
-</details>
-
-### Requirements
-
-This template is designed to work with Foundry (stable). If you are using Foundry Nightly, you may encounter compatibility issues. You can update your Foundry installation to the latest stable version by running:
-
-```
-foundryup
-```
-
-To set up the project, run the following commands in your terminal to install dependencies and run the tests:
-
-```
-forge install
-forge test
-```
-
-### Local Development
-
-Other than writing unit tests (recommended!), you can only deploy & test hooks on [anvil](https://book.getfoundry.sh/anvil/) locally. Scripts are available in the `script/` directory, which can be used to deploy hooks, create pools, provide liquidity and swap tokens. The scripts support both local `anvil` environment as well as running them directly on a production network.
-
-### Executing locally with using **Anvil**:
-
-1. Start Anvil (or fork a specific chain using anvil):
+End-to-end on anvil:
 
 ```bash
 anvil
+export PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80  # anvil account 0
+export RPC=http://localhost:8545
+
+forge script script/Deploy.s.sol --rpc-url $RPC --broadcast                               # hook + 5 pools
+POOL=0 PRICE_E6=186500000 forge script script/StartAuction.s.sol --rpc-url $RPC --broadcast # reopen at 186.5
+forge script script/Status.s.sol --rpc-url $RPC                                           # watch the price fall
+POOL=0 BIDDER_KEY=<another key> forge script script/Bid.s.sol --rpc-url $RPC --broadcast   # win, arb, pay LPs
 ```
 
-or
+On a testnet with Uniswap v4, use the same commands with your RPC. `Deploy` uses hookmate's canonical v4 addresses
+for that chain. `PRICE_E6` is currency1 per currency0 in whole tokens, scaled by 1e6. Env options are documented at
+the top of each script.
 
-```bash
-anvil --fork-url <YOUR_RPC_URL>
-```
+## Threat model
 
-2. Execute scripts:
+| Risk | Mitigation / status |
+|---|---|
+| **JIT liquidity**: add liquidity right before the win, take part of the donation, remove it | Liquidity adds revert while the auction is live. The swap and the donation happen atomically. |
+| **Keeper front-run**: an arb swaps at the stale price before `startAuction` lands | **Open.** The keeper must lock at or before the reopen. Better: lock at market close and only set the reference price at reopen, or start via Chainlink CRE. |
+| **Wrong reference price**: the keeper is trusted for `refPrice` | It only sets the start price. The winner chooses its own swap, and a too-high start just decays. A malicious keeper can lock a pool for at most `auctionBlocks`. The owner can `cancelAuction`. |
+| **Estimate too low** (concentrated liquidity crossing ticks) | The 1.5x premium absorbs part of it. A too-low start leaves value to the winner but never harms LPs compared with vanilla. |
+| **Bidder overpays / gets sandwiched** | The `maxBid` guard. The swap uses `sqrtPriceLimitX96` for the price limit. Nobody else can swap while the auction is live. |
+| **Block builder censors other bidders** | Inherent to block-based Dutch auctions. A short auction caps it. |
+| **Stuck pool** | It auto-reopens after `endBlock`, and the owner can `cancelAuction`. |
+| **Native ETH pools** | Not supported (`NativeCurrencyUnsupported`). |
+| **Owner/keeper keys** | Single EOA for the hackathon. Use a multisig and a CRE workflow in production. |
 
-```bash
-forge script script/00_DeployHook.s.sol \
-    --rpc-url http://localhost:8545 \
-    --private-key <PRIVATE_KEY> \
-    --broadcast
-```
+## Limitations / next
 
-### Using **RPC URLs** (actual transactions):
-
-:::info
-It is best to not store your private key even in .env or enter it directly in the command line. Instead use the `--account` flag to select your private key from your keystore.
-:::
-
-### Follow these steps if you have not stored your private key in the keystore:
-
-<details>
-
-1. Add your private key to the keystore:
-
-```bash
-cast wallet import <SET_A_NAME_FOR_KEY> --interactive
-```
-
-2. You will prompted to enter your private key and set a password, fill and press enter:
-
-```
-Enter private key: <YOUR_PRIVATE_KEY>
-Enter keystore password: <SET_NEW_PASSWORD>
-```
-
-You should see this:
-
-```
-`<YOUR_WALLET_PRIVATE_KEY_NAME>` keystore was saved successfully. Address: <YOUR_WALLET_ADDRESS>
-```
-
-::: warning
-Use `history -c` to clear your command history.
-:::
-
-</details>
-
-1. Execute scripts:
-
-```bash
-forge script script/00_DeployHook.s.sol \
-    --rpc-url <YOUR_RPC_URL> \
-    --account <YOUR_WALLET_PRIVATE_KEY_NAME> \
-    --sender <YOUR_WALLET_ADDRESS> \
-    --broadcast
-```
-
-You will prompted to enter your wallet password, fill and press enter:
-
-```
-Enter keystore password: <YOUR_PASSWORD>
-```
-
-### Key Modifications to note:
-
-1. Update the `token0` and `token1` addresses in the `BaseScript.sol` file to match the tokens you want to use in the network of your choice for sepolia and mainnet deployments.
-2. Update the `token0Amount` and `token1Amount` in the `CreatePoolAndAddLiquidity.s.sol` file to match the amount of tokens you want to provide liquidity with.
-3. Update the `token0Amount` and `token1Amount` in the `AddLiquidity.s.sol` file to match the amount of tokens you want to provide liquidity with.
-4. Update the `amountIn` and `amountOutMin` in the `Swap.s.sol` file to match the amount of tokens you want to swap.
-
-### Verifying the hook contract
-
-```bash
-forge verify-contract \
-  --rpc-url <URL> \
-  --chain <CHAIN_NAME_OR_ID> \
-  # Generally etherscan
-  --verifier <Verification_Provider> \
-  # Use --etherscan-api-key <ETHERSCAN_API_KEY> if you are using etherscan
-  --verifier-api-key <Verification_Provider_API_KEY> \
-  --constructor-args <ABI_ENCODED_ARGS> \
-  --num-of-optimizations <OPTIMIZER_RUNS> \
-  <Contract_Address> \
-  <path/to/Contract.sol:ContractName>
-  --watch
-```
-
-### Troubleshooting
-
-<details>
-
-#### Permission Denied
-
-When installing dependencies with `forge install`, Github may throw a `Permission Denied` error
-
-Typically caused by missing Github SSH keys, and can be resolved by following the steps [here](https://docs.github.com/en/github/authenticating-to-github/connecting-to-github-with-ssh)
-
-Or [adding the keys to your ssh-agent](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/generating-a-new-ssh-key-and-adding-it-to-the-ssh-agent#adding-your-ssh-key-to-the-ssh-agent), if you have already uploaded SSH keys
-
-#### Anvil fork test failures
-
-Some versions of Foundry may limit contract code size to ~25kb, which could prevent local tests to fail. You can resolve this by setting the `code-size-limit` flag
-
-```
-anvil --code-size-limit 40000
-```
-
-#### Hook deployment failures
-
-Hook deployment failures are caused by incorrect flags or incorrect salt mining
-
-1. Verify the flags are in agreement:
-   - `getHookCalls()` returns the correct flags
-   - `flags` provided to `HookMiner.find(...)`
-2. Verify salt mining is correct:
-   - In **forge test**: the _deployer_ for: `new Hook{salt: salt}(...)` and `HookMiner.find(deployer, ...)` are the same. This will be `address(this)`. If using `vm.prank`, the deployer will be the pranking address
-   - In **forge script**: the deployer must be the CREATE2 Proxy: `0x4e59b44847b379578588920cA78FbF26c0B4956C`
-     - If anvil does not have the CREATE2 deployer, your foundry may be out of date. You can update it with `foundryup`
-
-</details>
-
-### Additional Resources
-
-- [Uniswap v4 docs](https://docs.uniswap.org/contracts/v4/overview)
-- [v4-periphery](https://github.com/uniswap/v4-periphery)
-- [v4-core](https://github.com/uniswap/v4-core)
-- [v4-by-example](https://v4-by-example.org)
+- The keeper is a forge script. A Chainlink CRE workflow that detects the reopen and calls `startAuction` is the next step.
+- The replay data is a placeholder. The comparison against alternative designs has a free column in the replay.
+- No frontend yet. `replay/results.csv` and the `AuctionStarted` / `AuctionWon` events are what it would read.
+- Solidity 0.8.30, Uniswap v4 via OpenZeppelin `uniswap-hooks` 1.1.0. The code is unaudited.

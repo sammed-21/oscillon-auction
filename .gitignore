@@ -16,3 +16,5 @@ docs/
 
 # Node modules
 node_modules/
+# Local anvil deployment addresses
+/deployments/31337.json
