@@ -1,6 +1,8 @@
-# Reopen Auction Hook
+# Oscillon Bell
 
-**A Uniswap v4 hook that auctions the first swap after a market reopen and pays the winning bid to LPs.**
+**A Uniswap v4 hook that auctions the first swap after the opening bell and pays the winning bid to LPs.**
+
+Part of Oscillon. The contract is `ReopenAuctionHook` (`src/ReopenAuctionHook.sol`).
 
 Tokenized stocks trade on-chain 24/7, but their real market closes every night and weekend. When it reopens, the
 underlying price jumps and the pool still sits at the stale close price. Whoever swaps first takes the whole gap
@@ -82,7 +84,7 @@ End-to-end on anvil:
 
 ```bash
 anvil
-export PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80  # anvil account 0
+# On anvil the scripts default to the public dev keys (#0 keeper/deployer, #1 bidder); no env needed.
 export RPC=http://localhost:8545
 
 forge script script/Deploy.s.sol --rpc-url $RPC --broadcast --skip-simulation           # hook + 5 pools

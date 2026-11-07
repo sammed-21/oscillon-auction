@@ -1,6 +1,6 @@
 # Uniswap v4 Developer Feedback
 
-Notes from building the Reopen Auction Hook during the hackathon. Each item is something we actually hit.
+Notes from building Oscillon Bell (the `ReopenAuctionHook`) during the hackathon. Each item is something we actually hit.
 
 ## What worked well
 

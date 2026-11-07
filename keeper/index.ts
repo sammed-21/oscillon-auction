@@ -1,5 +1,5 @@
 /**
- * Reopen Auction keeper.
+ * Oscillon Bell keeper (ReopenAuctionHook).
  *
  * Waits for the market to reopen (default NYSE: Mon-Fri 09:30 America/New_York), fetches each pool's
  * reference price, and calls `startAuction(key, refSqrtPriceX96)` on every pool. It then logs the

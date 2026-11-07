@@ -16,13 +16,18 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 
 import {Deployers} from "test/utils/Deployers.sol";
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {IUniswapV4Router04} from "hookmate/interfaces/router/IUniswapV4Router04.sol";
+import {V4PoolManagerDeployer} from "hookmate/artifacts/V4PoolManager.sol";
+import {V4PositionManagerDeployer} from "hookmate/artifacts/V4PositionManager.sol";
+import {V4RouterDeployer} from "hookmate/artifacts/V4Router.sol";
 import {Actions} from "@uniswap/v4-periphery/src/libraries/Actions.sol";
 import {ReopenAuctionHook} from "../src/ReopenAuctionHook.sol";
 
 /// @notice Deploys the hook (address mined with HookMiner), one mock token pair + pool per config entry,
 ///         and full-range liquidity. Writes deployments/<chainId>.json.
 /// @dev Env:
-///        PRIVATE_KEY          deployer (owner of the hook, LP)
+///        PRIVATE_KEY          deployer (owner of the hook, LP); defaults to anvil account #0 on chain 31337
 ///        KEEPER               keeper address (default: deployer)
 ///        PAIRS_CONFIG         pairs file (default: replay/gaps.json; uses closesE6[0] as the initial price)
 ///        AUCTION_BLOCKS       Dutch auction length (default 10)
@@ -35,7 +40,10 @@ contract DeployScript is Script, Deployers {
     string root = "root";
 
     function run() external {
-        uint256 pk = vm.envUint("PRIVATE_KEY");
+        // On anvil, default to the public dev account #0 so the local demo needs no env setup.
+        uint256 pk = block.chainid == 31337
+            ? vm.envOr("PRIVATE_KEY", uint256(0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80))
+            : vm.envUint("PRIVATE_KEY");
         deployer = vm.addr(pk);
         address keeper = vm.envOr("KEEPER", deployer);
         uint64 auctionBlocks = uint64(vm.envOr("AUCTION_BLOCKS", uint256(10)));
@@ -176,6 +184,42 @@ contract DeployScript is Script, Deployers {
     function _approveForLp(MockERC20 token) internal {
         token.approve(address(permit2), type(uint256).max);
         permit2.approve(address(token), address(positionManager), type(uint160).max, type(uint48).max);
+    }
+
+    // ------------------------------------------------------------------
+    // Anvil: reuse v4 core if a previous run already deployed it (CREATE2 addresses are fixed),
+    // so the script can be rerun on the same chain. The hook, tokens and pools are always fresh.
+    // ------------------------------------------------------------------
+
+    function _existingLocal(bytes memory initcode) internal view returns (address a) {
+        if (block.chainid != 31337) return address(0);
+        a = vm.computeCreate2Address(bytes32(0), keccak256(initcode), CREATE2_FACTORY);
+        if (a.code.length == 0) a = address(0);
+    }
+
+    function deployPoolManager() internal override {
+        address a = _existingLocal(abi.encodePacked(V4PoolManagerDeployer.initcode(), abi.encode(address(0x4444))));
+        if (a != address(0)) poolManager = IPoolManager(a);
+        else super.deployPoolManager();
+    }
+
+    function deployPositionManager() internal override {
+        address a = _existingLocal(
+            abi.encodePacked(
+                V4PositionManagerDeployer.initcode(),
+                abi.encode(address(poolManager), address(permit2), uint256(300_000), address(0), address(0))
+            )
+        );
+        if (a != address(0)) positionManager = IPositionManager(a);
+        else super.deployPositionManager();
+    }
+
+    function deployRouter() internal override {
+        address a = _existingLocal(
+            abi.encodePacked(V4RouterDeployer.initcode(), abi.encode(address(poolManager), address(permit2)))
+        );
+        if (a != address(0)) swapRouter = IUniswapV4Router04(payable(a));
+        else super.deployRouter();
     }
 
     function _etch(address target, bytes memory bytecode) internal override {

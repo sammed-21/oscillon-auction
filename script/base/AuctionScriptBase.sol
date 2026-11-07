@@ -60,7 +60,14 @@ abstract contract AuctionScriptBase is Script {
     }
 
     /// @dev Private key from env var `name`, falling back to PRIVATE_KEY.
+    ///      On anvil, missing keys default to the public dev accounts: #0 for the keeper, #1 for the bidder.
     function keyOr(string memory name) internal view returns (uint256) {
+        if (block.chainid == 31337) {
+            uint256 dev = keccak256(bytes(name)) == keccak256("BIDDER_KEY")
+                ? 0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d
+                : 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80;
+            return vm.envOr(name, vm.envOr("PRIVATE_KEY", dev));
+        }
         return vm.envOr(name, vm.envUint("PRIVATE_KEY"));
     }
 }
