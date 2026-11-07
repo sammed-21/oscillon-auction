@@ -58,7 +58,8 @@ contract BidScript is AuctionScriptBase {
         vm.stopBroadcast();
 
         console2.log("pool:", p.label);
-        console2.log("bid paid to LPs (raw):", bid);
+        console2.log("bid at simulation block (raw):", bid);
+        console2.log("note: the Dutch price is charged at the mined block; the AuctionWon event has the final bid");
         console2.log("swap amount0:", int256(d.amount0()));
         console2.log("swap amount1:", int256(d.amount1()));
     }
