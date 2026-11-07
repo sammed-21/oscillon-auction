@@ -67,6 +67,7 @@ script/StartAuction.s.sol          keeper: lock a pool at reopen
 script/Bid.s.sol                   bidder: win the auction and arb
 script/Status.s.sol                phase / Dutch price / pool price for every pool
 keeper/index.ts                    TS keeper: waits for market open, starts auctions, logs events
+web/                               frontend: live pools, Dutch price, bids to LPs, comparison chart
 replay/gaps.json                   pair config + close/open gaps (used by the replay and by Deploy)
 ```
 
@@ -84,7 +85,7 @@ anvil
 export PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80  # anvil account 0
 export RPC=http://localhost:8545
 
-forge script script/Deploy.s.sol --rpc-url $RPC --broadcast                               # hook + 5 pools
+forge script script/Deploy.s.sol --rpc-url $RPC --broadcast --skip-simulation           # hook + 5 pools
 POOL=0 PRICE_E6=186500000 forge script script/StartAuction.s.sol --rpc-url $RPC --broadcast # reopen at 186.5
 forge script script/Status.s.sol --rpc-url $RPC                                           # watch the price fall
 POOL=0 BIDDER_KEY=<another key> forge script script/Bid.s.sol --rpc-url $RPC --broadcast   # win, arb, pay LPs
@@ -100,6 +101,19 @@ PRIVATE_KEY=... RPC_URL=$RPC npx tsx index.ts --now   # --now skips the schedule
 
 Reference prices come from `keeper/prices.json` (`{"<poolIndex>": price}`). Swap `fetchRefPrices` for a real feed or a
 Chainlink CRE workflow. `OPEN_TIME` / `OPEN_TZ` change the schedule.
+
+Frontend (Vite + React + viem). It shows live pools, the phase badge, the Dutch price falling block by block, the decay
+curve, "Bid → LPs" after a win, an activity feed, and the vanilla-vs-auction chart from `replay/results.csv`:
+
+```bash
+cd web && npm install && npm run dev       # http://localhost:5173 (VITE_RPC_URL overrides the RPC)
+```
+
+On anvil, pick **Keeper · anvil #0** to start an auction, then **Bidder · anvil #1** to bid. Use **Mine block** to
+watch the price fall. On other chains, use **Connect browser wallet**. The app reads `deployments/<chainId>.json`.
+
+`--skip-simulation` is only for anvil. Deploy puts Permit2 on the fresh chain with `anvil_setCode`, and forge's
+on-chain simulation would otherwise check a state from before that call.
 
 On a testnet with Uniswap v4, use the same commands with your RPC. `Deploy` uses hookmate's canonical v4 addresses
 for that chain. `PRICE_E6` is currency1 per currency0 in whole tokens, scaled by 1e6. Env options are documented at
@@ -123,5 +137,5 @@ the top of each script.
 
 - The keeper (`keeper/index.ts`) uses a fixed schedule and a JSON price file. A Chainlink CRE workflow with a live price feed is the next step.
 - The replay data is a placeholder. The comparison against alternative designs has a free column in the replay.
-- No frontend yet. `replay/results.csv` and the `AuctionStarted` / `AuctionWon` events are what it would read.
+- The frontend reads state by polling. An indexer or subgraph would replace polling for production.
 - Solidity 0.8.30, Uniswap v4 via OpenZeppelin `uniswap-hooks` 1.1.0. The code is unaudited.
