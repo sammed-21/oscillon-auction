@@ -66,6 +66,7 @@ script/Deploy.s.sol                mine + deploy hook, mock pairs, pools, liquid
 script/StartAuction.s.sol          keeper: lock a pool at reopen
 script/Bid.s.sol                   bidder: win the auction and arb
 script/Status.s.sol                phase / Dutch price / pool price for every pool
+keeper/index.ts                    TS keeper: waits for market open, starts auctions, logs events
 replay/gaps.json                   pair config + close/open gaps (used by the replay and by Deploy)
 ```
 
@@ -89,6 +90,17 @@ forge script script/Status.s.sol --rpc-url $RPC                                 
 POOL=0 BIDDER_KEY=<another key> forge script script/Bid.s.sol --rpc-url $RPC --broadcast   # win, arb, pay LPs
 ```
 
+Keeper bot (TypeScript, viem). It waits for the next weekday 09:30 America/New_York, reads reference prices, starts
+every pool's auction and logs `AuctionStarted` / `AuctionWon`:
+
+```bash
+cd keeper && npm install
+PRIVATE_KEY=... RPC_URL=$RPC npx tsx index.ts --now   # --now skips the schedule (demo)
+```
+
+Reference prices come from `keeper/prices.json` (`{"<poolIndex>": price}`). Swap `fetchRefPrices` for a real feed or a
+Chainlink CRE workflow. `OPEN_TIME` / `OPEN_TZ` change the schedule.
+
 On a testnet with Uniswap v4, use the same commands with your RPC. `Deploy` uses hookmate's canonical v4 addresses
 for that chain. `PRICE_E6` is currency1 per currency0 in whole tokens, scaled by 1e6. Env options are documented at
 the top of each script.
@@ -109,7 +121,7 @@ the top of each script.
 
 ## Limitations / next
 
-- The keeper is a forge script. A Chainlink CRE workflow that detects the reopen and calls `startAuction` is the next step.
+- The keeper (`keeper/index.ts`) uses a fixed schedule and a JSON price file. A Chainlink CRE workflow with a live price feed is the next step.
 - The replay data is a placeholder. The comparison against alternative designs has a free column in the replay.
 - No frontend yet. `replay/results.csv` and the `AuctionStarted` / `AuctionWon` events are what it would read.
 - Solidity 0.8.30, Uniswap v4 via OpenZeppelin `uniswap-hooks` 1.1.0. The code is unaudited.
